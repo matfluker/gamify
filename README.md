@@ -83,7 +83,7 @@ That's it. No build server, no extra config.
 ```
 api/
   _app.js            Express app. All routes. Imported by both Vercel and local server.
-  [[...slug]].js     Vercel catch-all entry. Re-exports _app.js as the serverless function.
+  [...slug].js       Vercel catch-all entry. Re-exports _app.js as the serverless function.
   _lib/
     supabase.js      Service-role Supabase client (server-only).
     util.js          phone normalize, share-code gen, seeded RNG, ET-date helper,
