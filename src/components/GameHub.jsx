@@ -3,6 +3,7 @@ import { api } from '../api.js';
 import Monogram from './Monogram.jsx';
 import CreateGame from './CreateGame.jsx';
 import JoinGame from './JoinGame.jsx';
+import Loading from './Loading.jsx';
 
 export default function GameHub({ user, onPick, onLogout }) {
   const [games, setGames] = useState([]);
@@ -38,7 +39,7 @@ export default function GameHub({ user, onPick, onLogout }) {
         </div>
 
         <div className="game-list">
-          {loading ? <div className="empty">Loading…</div>
+          {loading ? <Loading />
             : games.length === 0
               ? <div className="empty">No games yet. Create one or join with a code.</div>
               : games.map(g => (

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <!-- Solid black brand card. White brand mark + wordmark, centered. -->
+  <rect width="1200" height="630" fill="#111111"/>
+  <!-- Brand mark: white circle with black "G" so it pops on the black card. -->
+  <circle cx="600" cy="270" r="120" fill="#ffffff"/>
+  <text x="600" y="318"
+        font-family="Arial, Helvetica, sans-serif"
+        font-size="156" font-weight="800" fill="#111111"
+        text-anchor="middle" letter-spacing="-4">G</text>
+  <!-- Wordmark beneath. -->
+  <text x="600" y="490"
+        font-family="Arial, Helvetica, sans-serif"
+        font-size="84" font-weight="800" fill="#ffffff"
+        text-anchor="middle" letter-spacing="-2">Gamify</text>
+</svg>

@@ -257,6 +257,34 @@ app.post('/api/auth/invite-join', async (req, res) => {
   } catch (e) { sendError(res, e); }
 });
 
+// GET /api/auth/me — return the freshest user row. Used on app mount so
+// stale localStorage data (e.g. missing onboarded_at on returning users)
+// gets refreshed without a re-login.
+app.get('/api/auth/me', async (req, res) => {
+  try {
+    const user = await requireUser(req);
+    res.json({ user });
+  } catch (e) { sendError(res, e); }
+});
+
+// POST /api/auth/complete-onboarding — stamp users.onboarded_at so the
+// welcome tour doesn't show again on any device.
+app.post('/api/auth/complete-onboarding', async (req, res) => {
+  try {
+    const user = await requireUser(req);
+    if (user.onboarded_at) return res.json({ user });
+    const [updated] = await expectWrite(
+      `mark onboarded for user ${user.id}`,
+      1,
+      supabase.from('users')
+        .update({ onboarded_at: new Date().toISOString() })
+        .eq('id', user.id)
+        .select('*'),
+    );
+    res.json({ user: updated });
+  } catch (e) { sendError(res, e); }
+});
+
 // POST /api/auth/complete-profile  body: { firstName, lastName }
 app.post('/api/auth/complete-profile', async (req, res) => {
   try {
@@ -298,14 +326,28 @@ app.get('/api/me/games', async (req, res) => {
   } catch (e) { sendError(res, e); }
 });
 
-// POST /api/games — create a game. body: { title, pairs: [{term, definition}] }
-// Prompt direction is now randomized per-card in Learn/Quiz/Test (no per-game
-// direction). For DB compatibility we still write 'term' to the column.
+// Allowed values for the per-game direction setting. See schema.sql for the
+// behavior of each mode in Quiz / Test / Learn.
+const DIRECTIONS = ['term', 'definition', 'shuffle'];
+function normalizeDirection(v, fallback = 'shuffle') {
+  return DIRECTIONS.includes(v) ? v : fallback;
+}
+
+// Resolve the card-level direction ('term'|'definition') from the game's
+// direction setting. Shuffle picks per-card; the others are fixed.
+function pickCardDirection(gameDirection) {
+  if (gameDirection === 'term') return 'term';
+  if (gameDirection === 'definition') return 'definition';
+  return Math.random() < 0.5 ? 'definition' : 'term';
+}
+
+// POST /api/games — create a game. body: { title, pairs: [{term, definition}], direction }
 app.post('/api/games', async (req, res) => {
   try {
     const user = await requireUser(req);
     const title = String(req.body?.title || '').trim();
     const pairs = Array.isArray(req.body?.pairs) ? req.body.pairs : [];
+    const direction = normalizeDirection(req.body?.direction);
     if (!title) return res.status(400).json({ error: 'Title is required.' });
     const cleanPairs = pairs
       .map(p => ({ term: String(p.term || '').trim(), definition: String(p.definition || '').trim() }))
@@ -325,7 +367,7 @@ app.post('/api/games', async (req, res) => {
     if (!shareCode) return res.status(500).json({ error: 'Could not generate share code.' });
 
     const { data: game, error: gErr } = await supabase.from('games').insert({
-      title, admin_user_id: user.id, share_code: shareCode, direction: 'term',
+      title, admin_user_id: user.id, share_code: shareCode, direction,
     }).select('*').single();
     if (gErr) throw gErr;
 
@@ -389,6 +431,56 @@ app.get('/api/games/:id', async (req, res) => {
   } catch (e) { sendError(res, e); }
 });
 
+// PUT /api/games/:id — admin updates game-level settings (currently just
+// direction). "Apply immediately to everything": today's frozen quiz/test
+// sets are deleted (next access regenerates them with the new direction) and
+// every active Learn run has its per-card direction rewritten.
+app.put('/api/games/:id', async (req, res) => {
+  try {
+    const user = await requireUser(req);
+    const { id } = req.params;
+    const { data: game } = await supabase.from('games').select('*').eq('id', id).maybeSingle();
+    if (!game) return res.status(404).json({ error: 'Game not found.' });
+    if (game.admin_user_id !== user.id) return res.status(403).json({ error: 'Only the admin can update this game.' });
+
+    const newDirection = req.body?.direction;
+    if (!newDirection || !DIRECTIONS.includes(newDirection)) {
+      return res.status(400).json({ error: 'Invalid direction.' });
+    }
+    if (newDirection === game.direction) {
+      return res.json({ game });
+    }
+
+    const [updated] = await expectWrite(
+      `update direction for game ${id}`,
+      1,
+      supabase.from('games').update({ direction: newDirection }).eq('id', id).select('*'),
+    );
+
+    // Wipe today's (and any future) frozen daily sets so the next quiz/test
+    // load builds a fresh set under the new direction.
+    const today = easternDateString();
+    await supabase.from('daily_question_sets').delete()
+      .eq('game_id', id).gte('date_et', today);
+
+    // Rewrite per-card direction on every active Learn run for this game.
+    const { data: runs } = await supabase.from('learn_runs')
+      .select('user_id, state').eq('game_id', id);
+    for (const r of (runs || [])) {
+      const state = r.state || {};
+      if (!state.cards) continue;
+      for (const cid of Object.keys(state.cards)) {
+        state.cards[cid].direction = pickCardDirection(newDirection);
+      }
+      await supabase.from('learn_runs')
+        .update({ state, updated_at: new Date().toISOString() })
+        .eq('user_id', r.user_id).eq('game_id', id);
+    }
+
+    res.json({ game: updated });
+  } catch (e) { sendError(res, e); }
+});
+
 // POST /api/games/:id/pairs — admin adds new pairs after launch.
 app.post('/api/games/:id/pairs', async (req, res) => {
   try {
@@ -421,9 +513,14 @@ app.post('/api/games/:id/pairs', async (req, res) => {
 });
 
 // PUT /api/games/:id/pairs — admin "Edit Pairs": diff-save the full editable
-// list. Edits and deletes only affect FUTURE Learn runs and FUTURE days:
-//   - Learn runs in progress still use the snapshot stored in run state.
-//   - Daily quiz/test already-seeded for today are frozen in daily_question_sets.
+// list. Changes apply IMMEDIATELY:
+//   - Today's (and future) daily_question_sets are deleted so the next quiz/
+//     test load builds a fresh set. Already-submitted attempts keep their
+//     locked score (we don't claw back or re-grade).
+//   - Active Learn runs are updated in-place: edited text propagates into the
+//     run's card snapshot; deleted pairs are dropped from cards + queue;
+//     newly-inserted pairs are picked up the next time the run loads (via
+//     syncNewPairs).
 // Body: { pairs: [{ id?, term, definition }] }
 // Rules:
 //   - Rows without id and with content -> insert.
@@ -497,6 +594,56 @@ app.put('/api/games/:id/pairs', async (req, res) => {
         inserts.length,
         supabase.from('pairs').insert(inserts).select('id'),
       );
+    }
+
+    // Apply immediately: regenerate today's quiz/test and push edits/deletes
+    // into every active Learn run for this game.
+    const today = easternDateString();
+    await supabase.from('daily_question_sets').delete()
+      .eq('game_id', id).gte('date_et', today);
+
+    const deletedIds = new Set(toDelete);
+    const updatedById = new Map();
+    for (const row of clean) {
+      if (!row.id) continue;
+      const prev = existingMap.get(row.id);
+      if (!prev) continue;
+      if (prev.term !== row.term || prev.definition !== row.definition) {
+        updatedById.set(row.id, { term: row.term, definition: row.definition });
+      }
+    }
+
+    if (deletedIds.size > 0 || updatedById.size > 0) {
+      const { data: runs } = await supabase.from('learn_runs')
+        .select('user_id, state').eq('game_id', id);
+      for (const r of (runs || [])) {
+        const state = r.state || {};
+        if (!state.cards) continue;
+        let dirty = false;
+        for (const cid of Object.keys(state.cards)) {
+          if (deletedIds.has(cid)) {
+            delete state.cards[cid];
+            state.queue = (state.queue || []).filter(q => q !== cid);
+            dirty = true;
+          } else if (updatedById.has(cid)) {
+            const u = updatedById.get(cid);
+            state.cards[cid].term = u.term;
+            state.cards[cid].definition = u.definition;
+            dirty = true;
+          }
+        }
+        if (!dirty) continue;
+        state.totalCards = Object.keys(state.cards).length;
+        // If every remaining card is mastered, mark the run complete so the
+        // next load offers a reset rather than a stuck "next card".
+        const remaining = Object.values(state.cards);
+        if (remaining.length > 0 && remaining.every(c => c.mastered) && !state.completedAt) {
+          state.completedAt = new Date().toISOString();
+        }
+        await supabase.from('learn_runs')
+          .update({ state, updated_at: new Date().toISOString() })
+          .eq('user_id', r.user_id).eq('game_id', id);
+      }
     }
 
     res.json({ ok: true, deleted: toDelete.length, updated: updatedCount, inserted: inserts.length });
@@ -584,14 +731,19 @@ app.get('/api/games/:id/leaderboard', async (req, res) => {
 // QUIZ / TEST  (deterministic per-day question set)
 // ===========================================================================
 
-function buildDailyQuestions(pairs, length, seedStr) {
+function buildDailyQuestions(pairs, length, seedStr, direction = 'shuffle') {
   if (pairs.length < length) return null;
   const rng = seededRng(seedStr);
   const chosen = shuffleWith(rng, pairs).slice(0, length);
   return chosen.map((p, i) => {
-    // Per-card random direction (seeded, so every player sees the SAME question
-    // set + same directions for a given game/day).
-    const showDefinition = rng() < 0.5;
+    // Consume the rng even when direction is fixed so the seeded sequence
+    // stays stable (changing direction still produces a coherent set; we
+    // delete cached sets on direction change so determinism is per-mode).
+    const coin = rng();
+    const showDefinition =
+      direction === 'definition' ? true
+      : direction === 'term' ? false
+      : coin < 0.5;
     const promptKey = showDefinition ? 'definition' : 'term';
     const answerKey = showDefinition ? 'term' : 'definition';
     const distractors = shuffleWith(rng, pairs.filter(x => x.id !== p.id))
@@ -615,8 +767,10 @@ async function getDailyAttempt(table, userId, gameId, dateEt) {
 }
 
 // Get-or-create today's frozen question set. Once written, today's set
-// never changes — admin edits to pairs only affect FUTURE days.
-async function getOrCreateDailyQuestions(gameId, kind, dateEt, length) {
+// never changes — admin edits to pairs only affect FUTURE days. The one
+// exception is a direction change, which deletes today's row in the PUT
+// /api/games/:id handler so the next access regenerates here.
+async function getOrCreateDailyQuestions(gameId, kind, dateEt, length, direction) {
   const { data: snap } = await supabase.from('daily_question_sets')
     .select('questions').eq('game_id', gameId).eq('kind', kind).eq('date_et', dateEt).maybeSingle();
   if (snap?.questions && Array.isArray(snap.questions) && snap.questions.length === length) {
@@ -628,8 +782,8 @@ async function getOrCreateDailyQuestions(gameId, kind, dateEt, length) {
       .eq('game_id', gameId).is('deleted_at', null),
   );
   if (!pairs || pairs.length < length) return null;
-  const seed = `${kind}|${gameId}|${dateEt}`;
-  const questions = buildDailyQuestions(pairs, length, seed);
+  const seed = `${kind}|${gameId}|${dateEt}|${direction}`;
+  const questions = buildDailyQuestions(pairs, length, seed, direction);
   if (!questions) return null;
   await supabase.from('daily_question_sets').upsert(
     { game_id: gameId, kind, date_et: dateEt, questions },
@@ -650,7 +804,8 @@ async function quizOrTestGet(req, res, kind) {
   if (!mem) return res.status(403).json({ error: 'Not in this game.' });
 
   const dateEt = easternDateString();
-  const questions = await getOrCreateDailyQuestions(id, kind, dateEt, length);
+  const direction = normalizeDirection(game.direction);
+  const questions = await getOrCreateDailyQuestions(id, kind, dateEt, length, direction);
   if (!questions) {
     const pairs = await expectRead(
       `count pairs for ${kind} availability on game ${id}`,
@@ -690,7 +845,8 @@ async function quizOrTestSubmit(req, res, kind) {
   const existing = await getDailyAttempt(table, user.id, id, dateEt);
   if (existing) return res.status(409).json({ error: `Already taken today.`, attempt: existing });
 
-  const questions = await getOrCreateDailyQuestions(id, kind, dateEt, length);
+  const direction = normalizeDirection(game.direction);
+  const questions = await getOrCreateDailyQuestions(id, kind, dateEt, length, direction);
   if (!questions) return res.status(400).json({ error: 'Not enough content.' });
   const submitted = Array.isArray(req.body?.answers) ? req.body.answers : [];
 
@@ -733,7 +889,7 @@ app.post('/api/games/:id/test', (req, res) => quizOrTestSubmit(req, res, 'test')
 
 // Build a fresh run state for the given pairs. Term/definition are snapshotted
 // into each card so future admin edits to a pair don't disturb an active run.
-function newRunState(pairs) {
+function newRunState(pairs, gameDirection = 'shuffle') {
   const cards = {};
   for (const p of pairs) {
     cards[p.id] = {
@@ -743,8 +899,9 @@ function newRunState(pairs) {
       mastered: false,
       paidOut: false,
       // Direction is assigned ONCE per card and kept for the card's entire life
-      // in this run (across MC -> TIO and any repeats). Per-card random.
-      direction: Math.random() < 0.5 ? 'definition' : 'term',
+      // in this run (across MC -> TIO and any repeats). For fixed-direction
+      // games, every card uses that direction; for 'shuffle', per-card random.
+      direction: pickCardDirection(gameDirection),
       term: p.term,
       definition: p.definition,
     };
@@ -774,7 +931,7 @@ function newRunState(pairs) {
   };
 }
 
-async function loadOrInitRun(userId, gameId) {
+async function loadOrInitRun(userId, gameId, gameDirection = 'shuffle') {
   const { data: row } = await supabase.from('learn_runs').select('*')
     .eq('user_id', userId).eq('game_id', gameId).maybeSingle();
   if (row?.state?.cards && row?.state?.queue) return { state: row.state, isNew: false };
@@ -787,7 +944,7 @@ async function loadOrInitRun(userId, gameId) {
   if (!pairs || pairs.length === 0) {
     const e = new Error('No content in this game yet.'); e.status = 400; throw e;
   }
-  const state = newRunState(pairs);
+  const state = newRunState(pairs, gameDirection);
   await supabase.from('learn_runs').upsert({
     user_id: userId, game_id: gameId, state, updated_at: new Date().toISOString(),
   }, { onConflict: 'user_id,game_id' });
@@ -807,7 +964,7 @@ async function saveRun(userId, gameId, state) {
 // them; the run's totalCards expands too, so each card slice is recomputed
 // proportionally for the cards still unpaid. Active runs are immune to edits
 // or deletes of already-known pairs — those only show up in the next run.
-async function syncNewPairs(state, gameId) {
+async function syncNewPairs(state, gameId, gameDirection = 'shuffle') {
   const pairs = await expectRead(
     `sync new pairs into active Learn run for game ${gameId}`,
     supabase.from('pairs').select('id, term, definition')
@@ -819,7 +976,7 @@ async function syncNewPairs(state, gameId) {
   // those landed).
   for (const id of Object.keys(state.cards)) {
     if (!state.cards[id].direction) {
-      state.cards[id].direction = Math.random() < 0.5 ? 'definition' : 'term';
+      state.cards[id].direction = pickCardDirection(gameDirection);
     }
     if (state.cards[id].term == null || state.cards[id].definition == null) {
       const cur = (pairs || []).find(p => p.id === id);
@@ -834,7 +991,7 @@ async function syncNewPairs(state, gameId) {
     state.cards[p.id] = {
       phase: 'mc', missedInPhase: false, consecutiveCorrect: 0,
       mastered: false, paidOut: false,
-      direction: Math.random() < 0.5 ? 'definition' : 'term',
+      direction: pickCardDirection(gameDirection),
       term: p.term, definition: p.definition,
     };
     state.queue.push(p.id);
@@ -930,8 +1087,9 @@ app.get('/api/games/:id/learn', async (req, res) => {
       .select('user_id').eq('user_id', user.id).eq('game_id', id).maybeSingle();
     if (!mem) return res.status(403).json({ error: 'Not in this game.' });
 
-    let { state } = await loadOrInitRun(user.id, id);
-    state = await syncNewPairs(state, id);
+    const direction = normalizeDirection(game.direction);
+    let { state } = await loadOrInitRun(user.id, id, direction);
+    state = await syncNewPairs(state, id, direction);
     await saveRun(user.id, id, state);
 
     const nextCard = await buildNextCardPayload(state, id);
@@ -956,8 +1114,9 @@ app.post('/api/games/:id/learn/answer', async (req, res) => {
     const { data: game } = await supabase.from('games').select('*').eq('id', id).maybeSingle();
     if (!game) return res.status(404).json({ error: 'Game not found.' });
 
-    let { state } = await loadOrInitRun(user.id, id);
-    state = await syncNewPairs(state, id);
+    const direction = normalizeDirection(game.direction);
+    let { state } = await loadOrInitRun(user.id, id, direction);
+    state = await syncNewPairs(state, id, direction);
 
     if (state.queue[0] !== pairId) {
       return res.status(409).json({ error: 'Card mismatch — refresh and continue.' });
@@ -1076,7 +1235,9 @@ app.post('/api/games/:id/learn/exit', async (req, res) => {
   try {
     const user = await requireUser(req);
     const { id } = req.params;
-    const { state } = await loadOrInitRun(user.id, id);
+    const { data: game } = await supabase.from('games').select('direction').eq('id', id).maybeSingle();
+    const direction = normalizeDirection(game?.direction);
+    const { state } = await loadOrInitRun(user.id, id, direction);
     const masters = Object.values(state.cards).filter(c => c.mastered).length;
     const slice = LEARN_RUN_POINTS / Math.max(state.totalCards, 1);
     const bankedSinceLastExit = Math.max(0, masters - (state.mastersBankedAtLastExit || 0)) * slice;
@@ -1096,13 +1257,15 @@ app.post('/api/games/:id/learn/reset', async (req, res) => {
   try {
     const user = await requireUser(req);
     const { id } = req.params;
+    const { data: game } = await supabase.from('games').select('direction').eq('id', id).maybeSingle();
+    const direction = normalizeDirection(game?.direction);
     const pairs = await expectRead(
       `load pairs for Learn reset on game ${id}`,
       supabase.from('pairs').select('id, term, definition')
         .eq('game_id', id).is('deleted_at', null),
     );
     if (!pairs?.length) return res.status(400).json({ error: 'No content in game.' });
-    const state = newRunState(pairs);
+    const state = newRunState(pairs, direction);
     await saveRun(user.id, id, state);
     res.json({ ok: true, state });
   } catch (e) { sendError(res, e); }

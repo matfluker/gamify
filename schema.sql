@@ -15,13 +15,25 @@
 create extension if not exists "pgcrypto";
 
 -- USERS: one row per phone (normalized). No password / no auth provider yet.
+-- onboarded_at: stamped the first time the user completes the welcome tour.
+-- Null means the 4-slide tour should still be shown.
 create table if not exists users (
   id              uuid primary key default gen_random_uuid(),
   phone           text not null unique,         -- normalized digits, US 10-digit form when possible
   first_name      text,
   last_name       text,
+  onboarded_at    timestamptz,
   created_at      timestamptz not null default now()
 );
+alter table users add column if not exists onboarded_at timestamptz;
+-- Existing users with a complete profile have already used the app; skip the
+-- welcome tour for them. New users (created after this migration) start with
+-- null and will see the 4-slide tour exactly once.
+update users
+   set onboarded_at = created_at
+ where onboarded_at is null
+   and first_name is not null
+   and last_name  is not null;
 -- Backfill the unique(phone) constraint on databases that were created from an
 -- earlier version of this schema (where it was missing). The API merges
 -- duplicates on login, but the constraint stops new ones from being created
@@ -41,17 +53,30 @@ begin
 end $$;
 
 -- GAMES: each Gamify game.
+-- direction controls how prompts are shown in Quiz / Test / Learn:
+--   'term'       -> always show the term, user recalls the definition
+--   'definition' -> always show the definition, user recalls the term
+--   'shuffle'    -> per-card random direction (the original Gamify default)
+-- Admin can change this at any time; the API regenerates today's quiz/test
+-- and rewrites direction on active Learn runs so the change is immediate.
 create table if not exists games (
   id              uuid primary key default gen_random_uuid(),
   title           text not null,
   admin_user_id   uuid not null references users(id) on delete cascade,
   share_code      text not null unique,
-  -- 'term' means the term (reference) is shown as the prompt and the user recalls the definition.
-  -- 'definition' means the definition is shown and the user recalls the term.
-  direction       text not null default 'term' check (direction in ('term','definition')),
+  direction       text not null default 'shuffle' check (direction in ('term','definition','shuffle')),
   created_at      timestamptz not null default now()
 );
 create index if not exists idx_games_admin on games(admin_user_id);
+
+-- Backfill direction column for databases created before 'shuffle' existed.
+-- Legacy code ignored the column and behaved as shuffle; treat existing rows
+-- the same so user-perceived behavior doesn't change.
+alter table games drop constraint if exists games_direction_check;
+alter table games alter column direction set default 'shuffle';
+update games set direction = 'shuffle' where direction not in ('term','definition','shuffle');
+alter table games add constraint games_direction_check
+  check (direction in ('term','definition','shuffle'));
 
 -- PAIRS: term/definition pairs that belong to a game.
 -- deleted_at: soft-delete marker. Pairs are NEVER hard-deleted because active

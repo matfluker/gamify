@@ -8,6 +8,8 @@ import TestsTab from './TestsTab.jsx';
 import LearnTab from './LearnTab.jsx';
 import EditPairs from './EditPairs.jsx';
 import InviteFriends from './InviteFriends.jsx';
+import OnboardingTour from './OnboardingTour.jsx';
+import Loading from './Loading.jsx';
 
 const TABS = [
   { id: 'profile',     label: 'Profile' },
@@ -22,10 +24,30 @@ export default function GameShell({ user, gameId, onSwitchGame, onLogout }) {
   const [game, setGame] = useState(null);
   const [pairs, setPairs] = useState([]);
   const [isAdmin, setIsAdmin] = useState(false);
-  const [tab, setTab] = useState('profile');
+  // Leaderboard is the landing tab so users open straight into the rankings.
+  const [tab, setTab] = useState('leaderboard');
   const [navOpen, setNavOpen] = useState(false);
   const [err, setErr] = useState('');
   const [showEditPairs, setShowEditPairs] = useState(false);
+
+  // First-run tour: shown until users.onboarded_at is set. Spotlight names the
+  // target group: 'rank' (leaderboard row) or 'activities' (Quiz/Test/Learn tabs).
+  const tourActive = !user.onboarded_at;
+  const [tourSpotlight, setTourSpotlight] = useState(null);
+  // Mirror tourSpotlight to a body data attribute so CSS can react to it from
+  // anywhere — the leaderboard row spotlight reads it without prop drilling.
+  useEffect(() => {
+    if (tourSpotlight) document.body.setAttribute('data-tour-spotlight', tourSpotlight);
+    else document.body.removeAttribute('data-tour-spotlight');
+    return () => document.body.removeAttribute('data-tour-spotlight');
+  }, [tourSpotlight]);
+  // Open the mobile sidebar only on slide 2 (Quiz/Test/Learn spotlight). On
+  // slide 1 the rank highlight lives on the leaderboard, so the sidebar must
+  // be out of the way. Slide 3 has no spotlight — sidebar closed feels cleaner.
+  useEffect(() => {
+    if (!tourActive) return;
+    setNavOpen(tourSpotlight === 'activities');
+  }, [tourActive, tourSpotlight]);
 
   // Learn-session interception:
   //   learnActive: LearnTab tells us when it's mid-run.
@@ -121,13 +143,13 @@ export default function GameShell({ user, gameId, onSwitchGame, onLogout }) {
       <button className="btn btn-secondary" onClick={onSwitchGame}>Back</button>
     </main></div>
   );
-  if (!game) return <div className="hub"><main className="hub-main"><div className="empty">Loading…</div></main></div>;
+  if (!game) return <div className="hub"><main className="hub-main"><Loading /></main></div>;
 
   return (
     <div className="shell">
       <button className="nav-toggle" onClick={() => setNavOpen(!navOpen)} aria-label="Menu">≡</button>
 
-      <aside className={`sidebar ${navOpen ? 'open' : ''}`}>
+      <aside className={`sidebar ${navOpen ? 'open' : ''} ${tourActive ? 'tour-active' : ''}`}>
         <div className="sidebar-top">
           <button className="game-switcher"
             onClick={() => tryNavigateTo({ kind: 'switch' })}
@@ -141,13 +163,17 @@ export default function GameShell({ user, gameId, onSwitchGame, onLogout }) {
         </div>
 
         <nav className="nav-tabs">
-          {TABS.map(t => (
-            <button key={t.id}
-              className={`nav-tab ${tab===t.id?'active':''}`}
-              onClick={() => tryNavigateTo({ kind: 'tab', value: t.id })}>
-              {t.label}
-            </button>
-          ))}
+          {TABS.map(t => {
+            const spotlight =
+              tourSpotlight === 'activities' && ['quizzes', 'tests', 'learn'].includes(t.id);
+            return (
+              <button key={t.id}
+                className={`nav-tab ${tab===t.id?'active':''} ${spotlight ? 'tour-spotlight' : ''}`}
+                onClick={() => tryNavigateTo({ kind: 'tab', value: t.id })}>
+                {t.label}
+              </button>
+            );
+          })}
         </nav>
 
         <div className="sidebar-bottom">
@@ -190,6 +216,16 @@ export default function GameShell({ user, gameId, onSwitchGame, onLogout }) {
       )}
 
       {showEditPairs && <EditPairs gameId={gameId} onClose={() => { setShowEditPairs(false); loadGame(); }} />}
+
+      {tourActive && (
+        <OnboardingTour
+          onSpotlightChange={setTourSpotlight}
+          onDone={(_u, opts) => {
+            setTourSpotlight(null);
+            if (opts?.takeQuiz) setTab('quizzes');
+          }}
+        />
+      )}
     </div>
   );
 }

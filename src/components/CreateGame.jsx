@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { api } from '../api.js';
 import Monogram from './Monogram.jsx';
 import InviteFriends from './InviteFriends.jsx';
+import DirectionPicker from './DirectionPicker.jsx';
 
 const BLANK_ROWS = 5;
 function makeRows(n) { return Array.from({ length: n }, () => ({ term: '', definition: '', flagged: false })); }
@@ -9,6 +10,7 @@ function makeRows(n) { return Array.from({ length: n }, () => ({ term: '', defin
 export default function CreateGame({ onCancel, onCreated }) {
   const [step, setStep] = useState(1);
   const [title, setTitle] = useState('');
+  const [direction, setDirection] = useState('shuffle');
   const [rows, setRows] = useState(makeRows(BLANK_ROWS));
   const [pasteText, setPasteText] = useState('');
   const [err, setErr] = useState('');
@@ -56,7 +58,7 @@ export default function CreateGame({ onCancel, onCreated }) {
     if (cleanPairs.length === 0) { setErr('Add at least one term and definition.'); return; }
     setBusy(true);
     try {
-      const { game } = await api.post('/api/games', { title: title.trim(), pairs: cleanPairs });
+      const { game } = await api.post('/api/games', { title: title.trim(), pairs: cleanPairs, direction });
       // Show the Share popup instead of immediately handing off to the shell.
       setCreatedGame(game);
     } catch (e) { setErr(e.message); }
@@ -123,6 +125,8 @@ export default function CreateGame({ onCancel, onCreated }) {
       </header>
       <main className="hub-main">
         <h2 className="section-title">Add your terms & definitions</h2>
+
+        <DirectionPicker value={direction} onChange={setDirection} />
 
         <div className="paste-block">
           <label className="field-label">Paste from a spreadsheet</label>

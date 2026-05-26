@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../api.js';
+import DirectionPicker from './DirectionPicker.jsx';
+import Loading from './Loading.jsx';
 
 // Admin-only "Edit Pairs" editor. Loads ALL existing pairs, lets the admin
 // edit term/definition, delete a pair via its trash icon, and add new pairs
@@ -8,9 +10,10 @@ import { api } from '../api.js';
 //   - rows without id  -> insert
 //   - rows with id     -> update if changed
 //   - missing rows     -> soft-delete
-// Edits/deletes only affect FUTURE Learn runs and FUTURE daily quizzes/tests.
-// Active Learn runs use a snapshot of pair text taken at run start; today's
-// daily quiz/test is frozen in daily_question_sets.
+// All edits apply IMMEDIATELY to everyone: today's frozen daily quiz/test is
+// dropped so the next load builds a fresh set against the new pairs, and
+// active Learn runs are updated in-place (deleted cards removed from queue
+// and state, updated text propagated into the run's card snapshot).
 const BLANK = () => ({ id: null, term: '', definition: '', flagged: false });
 
 export default function EditPairs({ gameId, onClose }) {
@@ -19,15 +22,22 @@ export default function EditPairs({ gameId, onClose }) {
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState('');
+  // Track both the loaded value and the editor's current selection so we only
+  // PUT direction when the admin actually changed it.
+  const [direction, setDirection] = useState('shuffle');
+  const [initialDirection, setInitialDirection] = useState('shuffle');
 
   useEffect(() => {
     let cancelled = false;
-    api.get(`/api/games/${gameId}`).then(({ pairs }) => {
+    api.get(`/api/games/${gameId}`).then(({ game, pairs }) => {
       if (cancelled) return;
       const fromDb = (pairs || []).map(p => ({
         id: p.id, term: p.term, definition: p.definition, flagged: false,
       }));
       setRows(fromDb.length ? fromDb : [BLANK(), BLANK(), BLANK()]);
+      const dir = game?.direction || 'shuffle';
+      setDirection(dir);
+      setInitialDirection(dir);
       setLoading(false);
     }).catch(e => { setErr(e.message); setLoading(false); });
     return () => { cancelled = true; };
@@ -65,6 +75,9 @@ export default function EditPairs({ gameId, onClose }) {
     if (cleanPairs.length === 0) { setErr('Add at least one pair.'); return; }
     setBusy(true);
     try {
+      if (direction !== initialDirection) {
+        await api.put(`/api/games/${gameId}`, { direction });
+      }
       await api.put(`/api/games/${gameId}/pairs`, { pairs: cleanPairs });
       onClose();
     } catch (e) { setErr(e.message); } finally { setBusy(false); }
@@ -79,8 +92,12 @@ export default function EditPairs({ gameId, onClose }) {
         </div>
         <div className="modal-body">
           <p className="hub-sub">
-            Changes apply to future Learn runs and future days only. Active Learn runs and today's quiz/test won't change.
+            Edits apply immediately to everyone. If a removed or edited card was in today's quiz or test, the daily set regenerates on the next load. Active Learn runs update in-place too.
           </p>
+
+          {loading ? null : (
+            <DirectionPicker value={direction} onChange={setDirection} />
+          )}
 
           <div className="paste-block">
             <label className="field-label">Paste from a spreadsheet</label>
@@ -94,7 +111,7 @@ export default function EditPairs({ gameId, onClose }) {
               disabled={!pasteText.trim()}>Fill cards from paste</button>
           </div>
 
-          {loading ? <div className="empty">Loading…</div> : (
+          {loading ? <Loading /> : (
             <>
               <div className="pair-list">
                 <div className="pair-row pair-header"><div>Term</div><div>Definition</div><div /></div>

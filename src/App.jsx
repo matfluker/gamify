@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import {
   getCurrentUser, setCurrentUser, getCurrentGameId, setCurrentGameId, onAuthChange, logout,
 } from './auth.js';
+import { api } from './api.js';
 import LoginScreen from './components/LoginScreen.jsx';
 import CompleteProfile from './components/CompleteProfile.jsx';
 import GameHub from './components/GameHub.jsx';
@@ -30,17 +31,60 @@ export default function App() {
   const [user, setUser] = useState(getCurrentUser());
   const [gameId, setGameId] = useState(getCurrentGameId());
   const [inviteCode, setInviteCode] = useState(readInviteCodeFromUrl());
-  const [, force] = useState(0);
+  const [autoJoinError, setAutoJoinError] = useState('');
 
   useEffect(() => onAuthChange(() => {
     setUser(getCurrentUser());
     setGameId(getCurrentGameId());
-    force(x => x + 1);
   }), []);
 
-  // Magic invite link short-circuits both the login screen and the code-entry
-  // step. The invite component handles login-or-create + enroll in one shot.
-  if (inviteCode) {
+  // Refresh the cached user on mount so fields added after this client cached
+  // (e.g. onboarded_at) become visible without forcing a re-login.
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    api.get('/api/auth/me').then(({ user: fresh }) => {
+      if (cancelled || !fresh) return;
+      setCurrentUser(fresh);
+    }).catch(() => { /* stale token / network — leave cached user as-is */ });
+    return () => { cancelled = true; };
+    // run once on mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // If a logged-in returning user lands on an invite link, use their stored
+  // session to join the game instead of forcing them through the phone form.
+  useEffect(() => {
+    if (!inviteCode || !user) return;
+    let cancelled = false;
+    api.post('/api/games/join', { shareCode: inviteCode }).then(({ game }) => {
+      if (cancelled) return;
+      setCurrentGameId(game.id);
+      clearInviteFromUrl();
+      setInviteCode(null);
+    }).catch(e => {
+      if (cancelled) return;
+      setAutoJoinError(e.message || 'Could not join this game.');
+    });
+    return () => { cancelled = true; };
+  }, [inviteCode, user]);
+
+  // Auto-pick the user's only game so they land straight on the Daily Quiz.
+  // If they're in 0 games we fall through to GameHub; >1 also stays on GameHub
+  // so they can pick.
+  useEffect(() => {
+    if (!user || !user.first_name || gameId || inviteCode) return;
+    let cancelled = false;
+    api.get('/api/me/games').then(({ games }) => {
+      if (cancelled) return;
+      if (games && games.length === 1) setCurrentGameId(games[0].id);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [user, gameId, inviteCode]);
+
+  // New phone hitting an invite link with no session: keep the existing
+  // phone-first invite flow. (Logged-in users are handled by the effect above.)
+  if (inviteCode && !user) {
     return (
       <InviteJoin
         shareCode={inviteCode}
@@ -51,6 +95,20 @@ export default function App() {
           setInviteCode(null);
         }} />
     );
+  }
+  if (inviteCode && user) {
+    if (autoJoinError) {
+      return (
+        <div className="hub"><main className="hub-main">
+          <div className="form-error">{autoJoinError}</div>
+          <button className="btn btn-secondary"
+            onClick={() => { clearInviteFromUrl(); setInviteCode(null); setAutoJoinError(''); }}>
+            Continue
+          </button>
+        </main></div>
+      );
+    }
+    return <div className="hub"><main className="hub-main"><div className="empty">Joining game…</div></main></div>;
   }
 
   if (!user) {

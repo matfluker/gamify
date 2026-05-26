@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { api } from '../api.js';
 import { tierForPoints, colorForTier } from '../utils/tiers.js';
 import TierIcon from './TierIcon.jsx';
+import Loading from './Loading.jsx';
 import { easternDateString, easternMonthDates, dowFromDateString, weeklyStreakCount } from '../utils/easternTime.js';
 
 export default function ProfileTab({ user, game }) {
@@ -16,7 +17,7 @@ export default function ProfileTab({ user, game }) {
   const monthDates = useMemo(() => easternMonthDates(new Date()), []);
 
   if (err) return <div className="form-error">{err}</div>;
-  if (!data) return <div className="empty">Loading…</div>;
+  if (!data) return <Loading />;
 
   const points = Number(data.totalPoints || 0);
   const tier = tierForPoints(points);

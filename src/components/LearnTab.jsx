@@ -6,6 +6,7 @@ import {
   RECENT_SESSIONS_CHART_COUNT, LEARN_RUN_POINTS,
 } from '../config.js';
 import SessionChart from './SessionChart.jsx';
+import Loading from './Loading.jsx';
 
 // Phases of the local UI state machine:
 //  - 'answering' : user is on a card (MC: picking; TIO: typing)
@@ -105,7 +106,7 @@ export default function LearnTab({ game, onExit, onActiveChange, onProgressChang
       </div>
     );
   }
-  if (!state) return <div className="empty">Loading…</div>;
+  if (!state) return <Loading />;
 
   const sessionIdx = (state.currentSessionAnswered || 0);
 
@@ -246,7 +247,7 @@ export default function LearnTab({ game, onExit, onActiveChange, onProgressChang
             onOverride={overrideTio}
             onContinue={continueTio}
           />
-        ) : <div className="empty">Loading next card…</div>}
+        ) : <Loading />}
       </div>
     </div>
   );

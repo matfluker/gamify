@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../api.js';
+import Loading from './Loading.jsx';
 
 // Shared component for both the daily Quiz and the daily Test.
 // Behavior matches the spec:
@@ -29,7 +30,7 @@ export default function QuizOrTest({ game, kind, length, onGoToLeaderboard }) {
   useEffect(() => { load(); }, [game.id, kind]);
 
   if (err) return <div className="form-error">{err}</div>;
-  if (!data) return <div className="empty">Loading…</div>;
+  if (!data) return <Loading />;
   if (!data.available) {
     return (
       <div className="tab-pad">
@@ -47,6 +48,16 @@ export default function QuizOrTest({ game, kind, length, onGoToLeaderboard }) {
   // so points earned == result.correct — even when revisiting a prior attempt.
   if (result) {
     const pointsEarned = justEarnedPoints != null ? justEarnedPoints : Number(result.correct || 0);
+    // Per-question recap. Prompts come from the question set we loaded earlier
+    // (data.questions); the user's answer + correct answer come from the
+    // locked attempt rows. Indexes line up because both arrays are ordered.
+    const recap = (result.answers || []).map((a, i) => ({
+      idx: i,
+      prompt: data?.questions?.[i]?.prompt || '',
+      chosen: a.chosen,
+      correct: a.correct,
+      isCorrect: !!a.isCorrect,
+    }));
     return (
       <div className="tab-pad">
         <h1 className="tab-title">{kind === 'quiz' ? 'Daily Quiz' : 'Daily Test'}</h1>
@@ -62,6 +73,34 @@ export default function QuizOrTest({ game, kind, length, onGoToLeaderboard }) {
             </button>
           ) : null}
         </div>
+
+        {recap.length > 0 ? (
+          <div className="recap">
+            <h3 className="recap-title">Review</h3>
+            <ol className="recap-list">
+              {recap.map(r => (
+                <li key={r.idx} className={`recap-item ${r.isCorrect ? 'ok' : 'no'}`}>
+                  <div className="recap-head">
+                    <span className="recap-badge" aria-hidden="true">{r.isCorrect ? '✓' : '✗'}</span>
+                    <span className="recap-prompt">{r.prompt}</span>
+                  </div>
+                  <div className="recap-row">
+                    <span className="recap-label">Your answer:</span>
+                    <span className={`recap-value ${r.isCorrect ? 'ok-text' : 'no-text'}`}>
+                      {r.chosen ?? <em className="muted">(skipped)</em>}
+                    </span>
+                  </div>
+                  {!r.isCorrect ? (
+                    <div className="recap-row">
+                      <span className="recap-label">Correct:</span>
+                      <span className="recap-value ok-text">{r.correct}</span>
+                    </div>
+                  ) : null}
+                </li>
+              ))}
+            </ol>
+          </div>
+        ) : null}
       </div>
     );
   }

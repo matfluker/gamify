@@ -3,13 +3,46 @@ import { api } from '../api.js';
 import { tierForPoints, colorForTier, rangeForTier } from '../utils/tiers.js';
 import { TIERS, QUIZ_LENGTH, QUIZ_MAX_POINTS, TEST_LENGTH, TEST_MAX_POINTS, LEARN_RUN_POINTS } from '../config.js';
 import TierIcon from './TierIcon.jsx';
-import InviteFriends from './InviteFriends.jsx';
+import InviteFriends, { buildInviteLink } from './InviteFriends.jsx';
 
 export default function LeaderboardTab({ user, game }) {
   const [rows, setRows] = useState([]);
   const [err, setErr] = useState('');
   const [showInvite, setShowInvite] = useState(false);
+  const [shareToast, setShareToast] = useState('');
   const timerRef = useRef(null);
+
+  // Build a concise, family-friendly share blob: game title, top 5 with first
+  // names + points, and a one-tap link back into the game. We share via the
+  // native share sheet when available (iOS/Android, modern desktop Safari);
+  // otherwise we copy to clipboard and flash a small confirmation.
+  async function shareLeaderboard() {
+    if (!rows.length) return;
+    const top = rows.slice(0, 5);
+    const lines = top.map((r, i) => {
+      const pts = Math.round(Number(r.totalPoints));
+      const name = (r.firstName || '').trim();
+      return `${i + 1}. ${name} — ${pts} pts`;
+    });
+    const link = buildInviteLink(game.share_code);
+    const text =
+      `${game.title} — Gamify Leaderboard\n\n` +
+      `${lines.join('\n')}\n\n` +
+      `Play with us: ${link}`;
+
+    if (typeof navigator !== 'undefined' && navigator.share) {
+      try { await navigator.share({ title: 'Gamify Leaderboard', text }); } catch { /* user cancelled */ }
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      setShareToast('Leaderboard copied!');
+      setTimeout(() => setShareToast(''), 1800);
+    } catch {
+      setShareToast('Could not copy — long-press to share.');
+      setTimeout(() => setShareToast(''), 2400);
+    }
+  }
 
   async function load() {
     try {
@@ -32,9 +65,11 @@ export default function LeaderboardTab({ user, game }) {
       <div className="lb-head">
         <h1 className="tab-title">Leaderboard</h1>
         <div className="lb-head-actions">
+          <button className="btn btn-secondary small" onClick={shareLeaderboard}>Share leaderboard</button>
           <button className="btn btn-secondary small" onClick={() => setShowInvite(true)}>Invite</button>
         </div>
       </div>
+      {shareToast ? <div className="share-toast" role="status">{shareToast}</div> : null}
 
       <InfoSections />
 
