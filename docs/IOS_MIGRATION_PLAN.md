@@ -24,8 +24,8 @@ After the user switch (see Phase 0.5 below), you'll `git clone` Gamify under `ma
 VS Code + the Claude Code extension you're using right now is the right tool. Claude Desktop is great for chat/research but doesn't have the file-editing, terminal, and IDE integration that this project needs. Stay in VS Code.
 
 Open **two VS Code windows side by side** (paths shown under the new `matfluker` user):
-- Window 1: `/Users/matfluker/Documents/Claude/Projects/Gamify` (existing web/backend repo) — used for Phases 1, 2, 2.5, 7 (privacy URLs)
-- Window 2: `/Users/matfluker/Documents/Claude/Projects/gamify-native` (new iOS repo) — used for Phases 3-7
+- Window 1: `/Users/matfluker/Documents/Gamify` (existing web/backend repo) — used for Phases 1, 2, 2.5, 7 (privacy URLs)
+- Window 2: `/Users/matfluker/Documents/gamify-native` (new iOS repo) — used for Phases 3-7
 
 Each window gets its own Claude Code session, scoped to that repo.
 
@@ -204,18 +204,17 @@ gh auth login
 
 **c. Clone both repos**:
 ```bash
-mkdir -p ~/Documents/Claude/Projects
-cd ~/Documents/Claude/Projects
+cd ~/Documents
 
-git clone git@github.com:<your-github-user>/Gamify.git
-# (plan is now at ~/Documents/Claude/Projects/Gamify/docs/IOS_MIGRATION_PLAN.md)
+gh repo clone matfluker/Gamify
+# (plan is now at ~/Documents/Gamify/docs/IOS_MIGRATION_PLAN.md)
 
-git clone git@github.com:<your-github-user>/gamify-native.git
+gh repo clone matfluker/gamify-native
 ```
 
 **d. Restore Gamify `.env`**:
 ```bash
-cd ~/Documents/Claude/Projects/Gamify
+cd ~/Documents/Gamify
 # Paste your saved Supabase creds:
 cat > .env <<'EOF'
 SUPABASE_URL=https://iuixpflmhcypcroiaoua.supabase.co
@@ -228,7 +227,7 @@ npm run dev   # confirm web app boots locally on http://localhost:5173
 **e. Install Claude Code extension in VS Code under the new user**:
 - Open VS Code → Extensions → search "Claude" → install
 - Sign in with the same Anthropic account
-- Open `~/Documents/Claude/Projects/Gamify` to verify the extension sees the repo
+- Open `~/Documents/Gamify` to verify the extension sees the repo
 
 **f. Apple Developer access**:
 Apple Developer credentials are tied to your **Apple ID**, not your Mac user account. Sign into developer.apple.com with the same Apple ID under `matfluker` — full access. Xcode → Settings → Accounts → "+" → add your Apple ID. Xcode will download certificates and provisioning profiles automatically when you start your first iOS build (Phase 8).
@@ -245,7 +244,7 @@ You'll paste its contents into Vercel as `APNS_KEY_P8` in Phase 2.2.
 ```bash
 npm install -g vercel
 vercel login
-cd ~/Documents/Claude/Projects/Gamify
+cd ~/Documents/Gamify
 vercel link   # links this repo to the existing Vercel project
 ```
 Verify env vars are visible: `vercel env ls`.
@@ -255,13 +254,13 @@ Verify env vars are visible: `vercel env ls`.
 - Confirm you can open the Gamify project's SQL Editor (you'll run Phase 1's migration here)
 
 ### Verification before moving on
-- [ ] `cd ~/Documents/Claude/Projects/Gamify && npm run dev` starts both web and API locally
+- [x] `cd ~/Documents/Gamify && npm run dev` starts both web and API locally
 - [ ] You can open the web app, log in with your phone, see your existing data
-- [ ] `gh repo view <your-user>/gamify-native` works
-- [ ] Xcode opens without prompting for license acceptance
-- [ ] VS Code's Claude extension is signed in
-- [ ] `~/.config/gamify/AuthKey.p8` exists with correct mode
-- [ ] `vercel env ls` shows `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`
+- [x] `gh repo view matfluker/gamify-native` works
+- [ ] Xcode opens without prompting for license acceptance *(deferred — install full Xcode from App Store before Phase 8; until then `sudo xcodebuild -license accept` fails with "requires Xcode")*
+- [x] VS Code's Claude extension is signed in
+- [ ] `~/.config/gamify/AuthKey.p8` exists with correct mode *(directory pre-created at 700; drop .p8 here when retrieved from password manager: `mv ~/Downloads/AuthKey_*.p8 ~/.config/gamify/AuthKey.p8 && chmod 600 ~/.config/gamify/AuthKey.p8`)*
+- [x] `vercel env ls` shows `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`
 
 After this, the entire rest of the plan operates under `/Users/matfluker/...` paths.
 
