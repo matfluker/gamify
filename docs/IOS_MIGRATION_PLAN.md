@@ -84,7 +84,6 @@ Don't wait until Phase 8. Aim for a TestFlight install by the end of Phase 5.
 ### 8. When you hit walls
 
 Specific things that commonly trip people up — flag these to Claude immediately if you hit them:
-- **Resend emails going to spam** → you need to verify your sending domain in Resend (add DKIM/SPF/DMARC DNS records). Resend's onboarding walks you through it.
 - **APNs "BadDeviceToken"** → you likely have `APNS_PRODUCTION=false` but trying to send to a production-signed build (or vice versa). Match the env to the build.
 - **Apple Sign In not appearing on real device** → the capability has to be enabled in BOTH the developer portal Bundle ID AND in `app.config.js` (`usesAppleSignIn: true`). Rebuild after toggling.
 - **Google Sign In crashing** → 99% of the time, `iosUrlScheme` in `app.config.js` doesn't match the reversed-DNS form of your Google iOS client ID exactly.
@@ -96,13 +95,13 @@ Specific things that commonly trip people up — flag these to Claude immediatel
 
 Gamify is a working web app: React 18 + Vite SPA on the frontend, Express on Vercel + Supabase Postgres on the backend. Users currently sign in by typing their phone number (no verification). Core mechanics: term/definition learning game with Daily Quiz (5Q), Daily Test (20Q), a Learn engine (MC → type-it-out → mastery), a 5-second-polling leaderboard, profile calendar/streak, share-code invites, and an onboarding tour.
 
-The user wants a native iOS app (App Store) that is functionally identical and ready for submission. The native app will share the existing backend (one database, one API) so a user is the same person on web and on iOS. Phone-based identity is being retired on iOS in favor of free auth (Sign in with Apple, Sign in with Google, email magic code via Supabase + Resend). Phone-based web accounts can be linked to native accounts one-time via a "link your phone" step. The existing web app continues to function unchanged in this phase; a follow-up phase will migrate the web app to match.
+The user wants a native iOS app (App Store) that is functionally identical and ready for submission. The native app will share the existing backend (one database, one API) so a user is the same person on web and on iOS. Phone-based identity is being retired on iOS in favor of free auth (Sign in with Apple + Sign in with Google for v1; email magic code deferred to v1.1). Phone-based web accounts can be linked to native accounts one-time via a "link your phone" step. The existing web app continues to function unchanged in this phase; a follow-up phase will migrate the web app to match.
 
 Decisions locked:
 - **Framework**: React Native + Expo (managed workflow).
 - **Platform**: iOS only, forever.
 - **Backend**: shared with web (same Vercel + Supabase).
-- **Auth**: Sign in with Apple (primary), Sign in with Google, email magic code via Supabase + Resend. No SMS, no per-user cost.
+- **Auth**: Sign in with Apple (primary) + Sign in with Google. **Email magic code deferred to v1.1** — anywhere this plan mentions email OTP, Resend, `email.js`, `email_otp_codes`, `EmailOtpFlow`, or `EmailOtpScreen`, treat it as out-of-scope for v1. The `email` column on users is still populated from Apple/Google identity tokens; we just don't run our own OTP flow. No SMS, no per-user cost.
 - **Account deletion**: hard delete from inside the app (Apple 5.1.1(v)).
 - **Code sharing**: utilities and config copied into `gamify-native` (no monorepo).
 - **Push notifications**: daily quiz reminder, leaderboard pass, weekly streak danger.
@@ -119,17 +118,17 @@ The goal of this plan is the App Store going live with iOS v1. The web app stays
 ## Critical Files to Modify or Create
 
 ### Existing repo (Gamify/) — backend only, additive changes
-- [schema.sql](schema.sql) — append additive ALTER TABLE + new `email_otp_codes` table.
+- [schema.sql](schema.sql) — append additive ALTER TABLE (already done in Phase 1). The `email_otp_codes` table is created but unused in v1; harmless to leave.
 - [api/_app.js](api/_app.js) — add new auth/push/cron endpoints; reuse `pickCanonicalUser` ([api/_app.js:46](api/_app.js#L46)), `mergeUserInto` ([api/_app.js:57](api/_app.js#L57)), `normalizePhone`, `easternDateString` (already imported there).
-- [api/_lib/](api/_lib/) — add `appleAuth.js`, `apns.js`, `email.js`.
+- [api/_lib/](api/_lib/) — add `appleAuth.js`, `apns.js`. (`email.js` deferred to v1.1.)
 - [vercel.json](vercel.json) — add `crons` array.
-- [package.json](package.json) — add `jose`, `google-auth-library`, `@parse/node-apn`, `resend`.
+- [package.json](package.json) — add `jose`, `google-auth-library`, `@parse/node-apn`. (`resend` deferred to v1.1.)
 - New static routes for `/privacy`, `/support`, `/terms` (in [public/](public/) or as Vite routes).
 
 ### New repo (gamify-native/) — Expo app, full creation
 - `app.config.js` — bundle ID, push entitlement, Apple Sign In plugin, Google iOS URL scheme.
 - `src/api/client.js` — port of [src/api.js](src/api.js), but uses `expo-secure-store` instead of `localStorage`.
-- `src/auth/{AppleSignIn,GoogleSignIn,EmailOtpFlow}.js`.
+- `src/auth/{AppleSignIn,GoogleSignIn}.js`.
 - `src/screens/auth/LoginScreen.js` — the three-auth-method screen (button hierarchy matters for Apple review).
 - `src/screens/gameshell/GameShellTabs.js` — bottom tab navigator replacing the web sidebar.
 - `src/push/registerForPushNotifications.js` — uses `getDevicePushTokenAsync`, NOT Expo's push token service.
@@ -266,10 +265,10 @@ After this, the entire rest of the plan operates under `/Users/matfluker/...` pa
 
 ---
 
-## Phase 1 — Backend: Schema Migration
-*~1 hour · all additions are idempotent and additive*
+## Phase 1 — Backend: Schema Migration ✅ DONE
+*~1 hour · all additions are idempotent and additive · migration applied 2026-05-27*
 
-Append to [schema.sql](schema.sql):
+Appended to [schema.sql](schema.sql:206-258) and run in Supabase SQL Editor. The `email_otp_codes` table is created but reserved for v1.1 — v1 doesn't read or write it.
 
 ```sql
 alter table users alter column phone drop not null;
@@ -313,30 +312,30 @@ Run in Supabase SQL Editor. Then immediately do **Phase 2.5** (web regression te
 jose                ^5.9.6     # verify Apple identity token JWT
 google-auth-library ^9.15.0    # verify Google ID token
 @parse/node-apn     ^6.4.1     # send APNs pushes via HTTP/2
-resend              ^4.0.1     # transactional email
 ```
+(`resend` dropped — email OTP is v1.1.)
 
 ### 2.2 Vercel env vars (Settings → Environment Variables)
+All 9 are already in Vercel as of Phase 0 — verify with `vercel env ls`:
 ```
-APPLE_BUNDLE_ID            com.<yourdomain>.gamify
-APPLE_TEAM_ID              <10-char>
-GOOGLE_IOS_CLIENT_ID       <client>.apps.googleusercontent.com
-APNS_KEY_ID                <10-char>
-APNS_TEAM_ID               <10-char>
-APNS_KEY_P8                <full .p8 contents, with literal \n between lines>
-APNS_BUNDLE_ID             com.<yourdomain>.gamify
+APPLE_BUNDLE_ID            com.mfluker.gamify
+APPLE_TEAM_ID              FTFYVG3CGV
+GOOGLE_IOS_CLIENT_ID       566919841297-n321929mual1olctr27kk438aru16oj8.apps.googleusercontent.com
+APNS_KEY_ID                VBSS8A6P33
+APNS_TEAM_ID               FTFYVG3CGV
+APNS_KEY_P8                <stored — single-line PEM with literal \n between lines; helper does .replace(/\\n/g, '\n')>
+APNS_BUNDLE_ID             com.mfluker.gamify
 APNS_PRODUCTION            false           # flip to true after App Store approval
-RESEND_API_KEY             re_xxx
-RESEND_FROM                Gamify <noreply@your-verified-domain.com>
-CRON_SECRET                <32-byte hex>
+CRON_SECRET                <32-byte hex — saved>
 ```
+(`RESEND_API_KEY` / `RESEND_FROM` dropped.)
 
 ### 2.3 New helpers
 **`api/_lib/appleAuth.js`** — verify Apple identity token JWT against `https://appleid.apple.com/auth/keys` using `jose`. Validate `iss`, `aud=APPLE_BUNDLE_ID`, `exp`. Returns the payload (`sub` is the stable Apple user ID).
 
-**`api/_lib/apns.js`** — wraps `@parse/node-apn` Provider with .p8 token auth from env. Single export `sendPush(deviceToken, { title, body, data })`. On `BadDeviceToken`/`Unregistered` (status 410), caller should clear the token from DB.
+**`api/_lib/apns.js`** — wraps `@parse/node-apn` Provider with .p8 token auth from env. Single export `sendPush(deviceToken, { title, body, data })`. On `BadDeviceToken`/`Unregistered` (status 410), caller should clear the token from DB. Helper does `process.env.APNS_KEY_P8.replace(/\\n/g, '\n')` to restore newlines in the PEM key.
 
-**`api/_lib/email.js`** — wraps Resend. Single export `sendOtpEmail(to, code)`. Requires verified sending domain (DKIM/SPF/DMARC) — see Risk Register.
+(`api/_lib/email.js` dropped — email OTP is v1.1.)
 
 ### 2.4 `findOrCreateUserByIdentity` (new function in [api/_app.js](api/_app.js))
 Mirror of existing `findOrCreateUserByPhone` ([api/_app.js:140](api/_app.js#L140)). Looks up by `apple_user_id OR google_user_id OR email`. Three branches:
@@ -349,8 +348,6 @@ Mirror of existing `findOrCreateUserByPhone` ([api/_app.js:140](api/_app.js#L140
 ```
 POST  /api/auth/apple              { identityToken, firstName?, lastName? }  → { user }
 POST  /api/auth/google             { idToken }                                → { user }
-POST  /api/auth/email-otp/start    { email }                                  → { ok: true }
-POST  /api/auth/email-otp/verify   { email, code, firstName?, lastName? }     → { user }
 POST  /api/auth/link-phone         { phone }      [authed]                    → { user }   (may be merged canonical)
 POST  /api/me/push-token           { apnsDeviceToken, timezone }  [authed]    → { ok: true }
 DELETE /api/me/push-token          [authed]                                   → { ok: true }
@@ -360,8 +357,7 @@ POST  /api/cron/notifications/daily-quiz            [cron-secret]
 POST  /api/cron/notifications/streak-danger         [cron-secret]
 POST  /api/cron/notifications/leaderboard-changes   [cron-secret]
 ```
-
-**Email OTP details**: 6-digit cryptographically random code, sha256-stored, 10-minute TTL, max 5 attempts, row deleted on success. Never reveal whether an email is known.
+(`/api/auth/email-otp/start` and `/api/auth/email-otp/verify` dropped — v1.1.)
 
 **Link-phone behavior**: if the entered phone belongs to an existing different user (the web account), call `mergeUserInto(iosUserId, webUserId)` — merge **iOS → web** so all web history (calendar, streak, points) is preserved on the canonical row. The web user's row absorbs the iOS user's auth identifiers. Return the canonical user; client replaces its `X-User-Id` with the new id.
 
@@ -383,10 +379,9 @@ POST  /api/cron/notifications/leaderboard-changes   [cron-secret]
 Cron handlers verify `x-vercel-cron` header per Vercel docs.
 
 ### 2.8 Smoke test each endpoint with curl before iOS app touches them
-```
-curl -X POST $BASE/api/auth/email-otp/start  -d '{"email":"you@x.com"}'
-curl -X POST $BASE/api/auth/email-otp/verify -d '{"email":"you@x.com","code":"...","firstName":"M","lastName":"F"}'
-```
+Apple/Google endpoints can only be tested with real identity/ID tokens from a device, so the practical Phase 2 smoke flow is:
+- Verify endpoint shape with `curl -X POST $BASE/api/auth/apple -d '{"identityToken":"junk"}'` → expect 400 with a clear "invalid token" message (proves routing + jose verification path is wired).
+- After the Expo app is wired in Phase 5, take the actual identity token from `expo-apple-authentication`'s response and replay against the live endpoint.
 
 ---
 
@@ -436,12 +431,12 @@ gamify-native/
   assets/{icon.png,splash.png,adaptive-icon.png}
   src/
     api/client.js                # SecureStore-backed X-User-Id wrapper
-    auth/{AppleSignIn,GoogleSignIn,EmailOtpFlow}.js
+    auth/{AppleSignIn,GoogleSignIn}.js
     config/index.js              # copied from web src/config.js
     utils/{phone,similarity,easternTime,tiers,haptics}.js
     components/{Monogram,TierIcon,Loading,SessionChart,DirectionPicker,...}.js
     screens/
-      auth/{LoginScreen,EmailOtpScreen,LinkPhoneScreen}.js
+      auth/{LoginScreen,LinkPhoneScreen}.js
       {GameHubScreen,CreateGameScreen,JoinGameScreen,InviteJoinScreen,OnboardingTour,SettingsScreen}.js
       gameshell/{GameShellTabs,ProfileTab,LeaderboardTab,QuizTab,TestTab,LearnTab,EditPairsModal}.js
     navigation/{RootNavigator,AuthNavigator,MainNavigator}.js
@@ -468,11 +463,12 @@ plugins: [
   'expo-apple-authentication',
   ['expo-notifications', { color: '#000000' }],
   ['@react-native-google-signin/google-signin',
-    { iosUrlScheme: 'com.googleusercontent.apps.<reversed-google-client-id>' }],
+    { iosUrlScheme: 'com.googleusercontent.apps.566919841297-n321929mual1olctr27kk438aru16oj8' }],
 ],
 extra: {
-  apiBase: process.env.EXPO_PUBLIC_API_BASE || 'https://<your-vercel>.vercel.app',
-  googleIosClientId: process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID,
+  apiBase: process.env.EXPO_PUBLIC_API_BASE || 'https://gamify-matflukers-projects.vercel.app',
+  googleIosClientId: process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID
+    || '566919841297-n321929mual1olctr27kk438aru16oj8.apps.googleusercontent.com',
 },
 ```
 
@@ -488,8 +484,8 @@ Port of [src/api.js](src/api.js). Replace localStorage with `expo-secure-store`.
 
 | Web | Native | Notes |
 |---|---|---|
-| [LoginScreen.jsx](src/components/LoginScreen.jsx) | `screens/auth/LoginScreen.js` | Rewrite: three buttons — Apple (top, mandatory style), Google, Email. No phone input. |
-| [CompleteProfile.jsx](src/components/CompleteProfile.jsx) | inline in LoginScreen / EmailOtpScreen | Apple gives name on first sign-in; Google gives it; email asks if missing. |
+| [LoginScreen.jsx](src/components/LoginScreen.jsx) | `screens/auth/LoginScreen.js` | Rewrite: two buttons — Apple (top, mandatory style), Google. No phone input. |
+| [CompleteProfile.jsx](src/components/CompleteProfile.jsx) | inline in LoginScreen | Apple gives name on first sign-in; Google gives it. No fallback needed since both providers return at least a display name. |
 | [GameHub.jsx](src/components/GameHub.jsx) | `screens/GameHubScreen.js` | `<FlatList>` or `<ScrollView>` of games. |
 | [CreateGame.jsx](src/components/CreateGame.jsx) | `screens/CreateGameScreen.js` | `<TextInput multiline>` replaces textareas. |
 | [JoinGame.jsx](src/components/JoinGame.jsx) | `screens/JoinGameScreen.js` | Simple code input. |
@@ -530,8 +526,8 @@ Wire `correct()`/`wrong()` into LearnTab's `commitAnswer` and QuizOrTest's gradi
 ### 5.2 Sign in with Google
 `@react-native-google-signin/google-signin`. `GoogleSignin.configure({ iosClientId })` in app boot. On button tap: `signIn() → getTokens() → POST /api/auth/google { idToken }`.
 
-### 5.3 Email magic code
-Two-step screen: email → "Send code" → 6-digit input → if new user, prompt first/last name → done.
+### 5.3 Email magic code (deferred to v1.1)
+Scoped out of v1.
 
 ### 5.4 Universal links (defer to v1.1)
 For v1, users enter share codes manually via JoinGame. Universal links (`/.well-known/apple-app-site-association` + `applinks:` entitlement + `expo-linking`) is a v1.1 task.
@@ -547,7 +543,7 @@ POST `/api/auth/link-phone { phone }`. If returned user has a different `id`, re
 `SettingsScreen` → "Delete Account" → confirmation modal → POST `/api/me/delete` → clear SecureStore → route to LoginScreen.
 
 ### 5.7 Apple button hierarchy (rejection-proofing)
-Per Apple 4.8: Apple Sign In must be at least as prominent as Google. Use the same button size in the same column: **Apple on top, Google below, Email below that.**
+Per Apple 4.8: Apple Sign In must be at least as prominent as Google. Use the same button size in the same column: **Apple on top, Google below.**
 
 ---
 
@@ -666,10 +662,10 @@ Wait ~10 min for processing in App Store Connect.
 10. Force-quit → reopen → still signed in (SecureStore).
 
 ### Submit for App Store review
-Provide demo credentials in App Review Information — easiest is a pre-seeded review email with a server-side fixed OTP code (e.g. `apple-review@<yourdomain>.com` → code `424242`), gated behind an env-var guard so it ONLY works for that one email.
+Since v1 only offers Apple + Google sign-in (no email OTP), demo credentials are optional — the reviewer can use Sign in with Apple with their own reviewer Apple ID. Pre-seed a sample game and add the reviewer's Apple ID (provided in App Review Information demo account fields if Apple supplies one) to it before submission so they land in a populated game on first launch.
 
 Notes for reviewer:
-> "Gamify is a learning game. Sign in with email `apple-review@<yourdomain>.com`; OTP `424242`. You'll see a sample game with Daily Quiz, Test, Learn, and Leaderboard. Account deletion is in Settings."
+> "Gamify is a learning game. Tap Sign in with Apple (top button) to create your account. You'll be auto-joined to a demo game with Daily Quiz, Test, Learn, and Leaderboard already populated. Account deletion is in Settings → Delete Account."
 
 Review typically 24–48 hours. Common rejections pre-empted:
 - **4.8**: Apple Sign In on top, same size as Google. ✓
@@ -687,8 +683,6 @@ Review typically 24–48 hours. Common rejections pre-empted:
 | Schema migration | Full web smoke test (Phase 2.5) | Every web flow still works |
 | Apple auth | curl with real identityToken from device | Returns `{ user }` with `apple_user_id` set |
 | Google auth | curl with idToken from `GoogleSignin.signIn` | Returns `{ user }` |
-| Email OTP start | curl, check inbox | Email within 30s, no plaintext code in DB |
-| Email OTP verify | curl with code | Returns `{ user }`; `email_otp_codes` row deleted |
 | Link-phone (no conflict) | iOS user enters new phone | `users.phone` updated |
 | Link-phone (merge) | iOS user enters web user's phone | iOS row merged into web row; web's `points_ledger`, `activity_log`, `memberships`, `learn_runs` preserved; iOS auth identifiers now on canonical row |
 | Push registration | Real device after grant | `users.apns_device_token` populated |
@@ -707,7 +701,6 @@ Review typically 24–48 hours. Common rejections pre-empted:
 | Risk | Severity | Mitigation |
 |---|---|---|
 | Schema migration breaks web | High | Phase 2.5 regression test before any iOS work; all changes additive |
-| Resend domain not verified → emails to spam | Medium | Verify DKIM/SPF/DMARC before launch; keep Apple-only as fallback path |
 | Apple rejects for "looks like a web app" | Medium | Bottom tabs + haptics + Apple Sign In + push + safe-area = clear native intent |
 | Apple rejects for missing account deletion | Low | Verified working on TestFlight before submit |
 | APNs token rotation/expiry | Medium | Re-register on every app launch; server clears bad tokens on 410 |
