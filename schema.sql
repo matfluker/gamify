@@ -201,3 +201,53 @@ create or replace view v_user_game_totals as
   select user_id, game_id, sum(points)::numeric(10,4) as total_points
   from points_ledger
   group by user_id, game_id;
+
+-- ============================================================================
+-- iOS migration (Phase 1 of docs/IOS_MIGRATION_PLAN.md)
+-- All additions are additive and idempotent. Existing web rows keep `phone`
+-- set; iOS-only rows will have `phone IS NULL` and use one of the new identity
+-- columns instead. Postgres treats NULLs as distinct in unique constraints,
+-- so multiple iOS-only rows with NULL phone coexist safely.
+-- ============================================================================
+
+-- Phone is no longer required: iOS users sign in with Apple / Google / email.
+alter table users alter column phone drop not null;
+
+-- New identity columns. The inline `unique` is applied only on first run
+-- (when the column doesn't yet exist) — re-runs no-op safely.
+alter table users add column if not exists apple_user_id     text unique;
+alter table users add column if not exists google_user_id    text unique;
+alter table users add column if not exists email             text unique;
+alter table users add column if not exists apns_device_token text;
+alter table users add column if not exists notification_prefs jsonb
+  not null default '{"daily": true, "passed": true, "streak": true}'::jsonb;
+alter table users add column if not exists timezone          text;
+alter table users add column if not exists deleted_at        timestamptz;
+alter table users add column if not exists last_seen_at      timestamptz;
+
+-- Partial indexes for fast lookup by each identity column.
+create index if not exists idx_users_email           on users(email)           where email is not null;
+create index if not exists idx_users_apple_user_id   on users(apple_user_id)   where apple_user_id is not null;
+create index if not exists idx_users_google_user_id  on users(google_user_id)  where google_user_id is not null;
+-- Cron handlers iterate over notifiable users by timezone; index scopes to
+-- live users with a registered device token.
+create index if not exists idx_users_timezone_active on users(timezone)
+  where deleted_at is null and apns_device_token is not null;
+
+-- Per-game JSONB { user_id: rank } captured after each leaderboard-changes
+-- cron run. Used to detect rank drops and send "X passed you" pushes.
+alter table games add column if not exists last_notified_ranks jsonb
+  not null default '{}'::jsonb;
+
+-- Email magic-code OTPs. We store sha256(code), never plaintext.
+-- TTL is enforced in the verify endpoint (10 min) and via the expires_at index
+-- for cleanup. attempts caps brute-force guessing.
+create table if not exists email_otp_codes (
+  email       text not null,
+  code_hash   text not null,
+  expires_at  timestamptz not null,
+  attempts    int not null default 0,
+  created_at  timestamptz not null default now(),
+  primary key (email)
+);
+create index if not exists idx_email_otp_expires on email_otp_codes(expires_at);
