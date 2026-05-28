@@ -1,7 +1,14 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npx vite *)"
+      "Bash(npx vite *)",
+      "Bash(node -e \"const p=require\\('./package.json'\\); for \\(const k of ['jose','google-auth-library','@parse/node-apn']\\) console.log\\(k.padEnd\\(22\\), p.dependencies?.[k] || 'MISSING'\\)\")",
+      "Bash(npm audit *)",
+      "Bash(node -e \"const a=JSON.parse\\(require\\('fs'\\).readFileSync\\(0,'utf8'\\)\\); const m=a.metadata?.vulnerabilities||{}; console.log\\(JSON.stringify\\(m\\)\\)\")",
+      "Bash(node --check api/_app.js)",
+      "Bash(node --check api/_lib/util.js)",
+      "Bash(python3 -c \"import json; json.load\\(open\\('vercel.json'\\)\\)\")",
+      "Bash(node -e \"import\\('./api/_app.js'\\).then\\(\\(\\) => console.log\\('app imports OK'\\)\\)\")"
     ]
   }
 }

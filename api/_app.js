@@ -3,12 +3,19 @@
 
 import express from 'express';
 import cors from 'cors';
+import { OAuth2Client } from 'google-auth-library';
 import { supabase, assertEnv } from './_lib/supabase.js';
-import { normalizePhone, easternDateString, genShareCode, seededRng, shuffleWith, sendError, expectWrite, expectRead } from './_lib/util.js';
+import { normalizePhone, easternDateString, easternWeekRange, genShareCode, seededRng, shuffleWith, sendError, expectWrite, expectRead } from './_lib/util.js';
+import { verifyAppleIdentityToken } from './_lib/appleAuth.js';
+import { sendPush } from './_lib/apns.js';
 import {
   QUIZ_LENGTH, QUIZ_MAX_POINTS, TEST_LENGTH, TEST_MAX_POINTS,
   LEARN_RUN_POINTS, CARDS_PER_SESSION, MC_OPTION_COUNT,
 } from './_lib/config.js';
+
+// google-auth-library only needs the iOS client ID at verify-time, so a
+// zero-config client is fine here.
+const googleAuthClient = new OAuth2Client();
 
 const app = express();
 app.use(cors());
@@ -176,6 +183,92 @@ async function findOrCreateUserByPhone({ phone, firstName, lastName }) {
   return { user, isNew: false };
 }
 
+// iOS analogue of findOrCreateUserByPhone. The caller verifies the OAuth
+// token (Apple JWT or Google ID token) and passes the resulting identifiers.
+// At least one of appleUserId / googleUserId / email must be present.
+//
+// Resolution rules (mirror of the phone version):
+//   0 matches  -> insert a fresh row with the provided fields.
+//   1 match    -> backfill missing identifier and name columns onto it.
+//   2+ matches -> the same human signed in via two providers and ended up on
+//                 different rows (e.g. Google first with their real email,
+//                 then Apple with a private-relay email that later got tied
+//                 back). Pick a canonical row, capture identifier columns
+//                 from the dupes, merge child rows via mergeUserInto (which
+//                 also deletes the dupes — that frees the unique values),
+//                 THEN write the captured identifiers onto canonical so they
+//                 don't get lost.
+async function findOrCreateUserByIdentity({ appleUserId, googleUserId, email, firstName, lastName }) {
+  // Look up by every provided identifier and de-dup the result set.
+  const seen = new Set();
+  const matches = [];
+  async function gather(column, value) {
+    if (!value) return;
+    const { data, error } = await supabase.from('users').select('*').eq(column, value);
+    if (error) throw error;
+    for (const u of data || []) {
+      if (!seen.has(u.id)) { seen.add(u.id); matches.push(u); }
+    }
+  }
+  await gather('apple_user_id', appleUserId);
+  await gather('google_user_id', googleUserId);
+  await gather('email', email);
+
+  if (matches.length === 0) {
+    const row = {};
+    if (appleUserId)  row.apple_user_id  = appleUserId;
+    if (googleUserId) row.google_user_id = googleUserId;
+    if (email)        row.email          = email;
+    if (firstName)    row.first_name     = firstName;
+    if (lastName)     row.last_name      = lastName;
+    const [created] = await expectWrite(
+      `create user for identity (apple=${appleUserId || '-'} google=${googleUserId || '-'} email=${email || '-'})`,
+      1,
+      supabase.from('users').insert(row).select('*'),
+    );
+    return { user: created, isNew: true };
+  }
+
+  let canonical = pickCanonicalUser(matches);
+  const dups = matches.filter(m => m.id !== canonical.id);
+
+  // Capture each dup's identifier values so we can re-attach them to canonical
+  // after mergeUserInto deletes the dup row. Only capture fields canonical is
+  // currently missing; never overwrite canonical's existing values.
+  const fromDups = {};
+  for (const d of dups) {
+    if (d.apple_user_id  && !canonical.apple_user_id  && !fromDups.apple_user_id)  fromDups.apple_user_id  = d.apple_user_id;
+    if (d.google_user_id && !canonical.google_user_id && !fromDups.google_user_id) fromDups.google_user_id = d.google_user_id;
+    if (d.email          && !canonical.email          && !fromDups.email)          fromDups.email          = d.email;
+    if (d.phone          && !canonical.phone          && !fromDups.phone)          fromDups.phone          = d.phone;
+    if (d.first_name     && !canonical.first_name     && !fromDups.first_name)     fromDups.first_name     = d.first_name;
+    if (d.last_name      && !canonical.last_name      && !fromDups.last_name)      fromDups.last_name      = d.last_name;
+  }
+
+  if (dups.length) {
+    console.warn('[gamify api] merging duplicate users on identity sign-in',
+      'canonical:', canonical.id, 'merging:', dups.map(d => d.id));
+    for (const d of dups) await mergeUserInto(d.id, canonical.id);
+  }
+
+  // Build the canonical update from captured dup fields + caller-supplied
+  // identifiers, never overwriting canonical's existing values.
+  const updates = { ...fromDups };
+  if (!canonical.apple_user_id  && updates.apple_user_id  === undefined && appleUserId)  updates.apple_user_id  = appleUserId;
+  if (!canonical.google_user_id && updates.google_user_id === undefined && googleUserId) updates.google_user_id = googleUserId;
+  if (!canonical.email          && updates.email          === undefined && email)        updates.email          = email;
+  if (!canonical.first_name     && updates.first_name     === undefined && firstName)    updates.first_name     = firstName;
+  if (!canonical.last_name      && updates.last_name      === undefined && lastName)     updates.last_name      = lastName;
+
+  if (Object.keys(updates).length > 0) {
+    const { data: updated, error: uErr } = await supabase.from('users')
+      .update(updates).eq('id', canonical.id).select('*').single();
+    if (uErr) throw uErr;
+    if (updated) canonical = updated;
+  }
+  return { user: canonical, isNew: false };
+}
+
 // POST /api/auth/login  body: { phone }
 // If a user already exists for this phone, return it (with their name intact
 // so the client skips CompleteProfile). Otherwise create a stub row.
@@ -305,6 +398,436 @@ app.post('/api/auth/complete-profile', async (req, res) => {
     res.json({ user: updated });
   } catch (e) { sendError(res, e); }
 });
+
+// ---------------------------------------------------------------------------
+// iOS auth (Sign in with Apple, Sign in with Google, phone linking)
+// ---------------------------------------------------------------------------
+
+// POST /api/auth/apple  body: { identityToken, firstName?, lastName? }
+// Apple ships first_name/last_name only on the FIRST sign-in (in the OAuth
+// response, not the JWT). The native app must forward them on that one call;
+// subsequent calls just send identityToken and we keep the name we already
+// stored. The JWT itself is verified against Apple's published JWKS.
+app.post('/api/auth/apple', async (req, res) => {
+  try {
+    assertEnv();
+    const identityToken = String(req.body?.identityToken || '').trim();
+    if (!identityToken) return res.status(400).json({ error: 'Missing identityToken.' });
+    const payload = await verifyAppleIdentityToken(identityToken);
+    const appleUserId = payload.sub;
+    const tokenEmail = typeof payload.email === 'string' ? payload.email.toLowerCase() : null;
+    const firstName = String(req.body?.firstName || '').trim() || null;
+    const lastName  = String(req.body?.lastName  || '').trim() || null;
+    const { user, isNew } = await findOrCreateUserByIdentity({
+      appleUserId, email: tokenEmail, firstName, lastName,
+    });
+    res.json({ user, isNew });
+  } catch (e) { sendError(res, e); }
+});
+
+// POST /api/auth/google  body: { idToken }
+// Google's verifyIdToken handles JWKS + audience + expiry; we just hand it
+// the iOS client ID we registered in Google Cloud Console.
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    assertEnv();
+    const idToken = String(req.body?.idToken || '').trim();
+    if (!idToken) return res.status(400).json({ error: 'Missing idToken.' });
+    const audience = process.env.GOOGLE_IOS_CLIENT_ID;
+    if (!audience) return res.status(500).json({ error: 'GOOGLE_IOS_CLIENT_ID is not set on the server.' });
+    let payload;
+    try {
+      const ticket = await googleAuthClient.verifyIdToken({ idToken, audience });
+      payload = ticket.getPayload();
+    } catch (err) {
+      return res.status(400).json({ error: `Invalid Google ID token: ${err.message}` });
+    }
+    const googleUserId = payload?.sub;
+    if (!googleUserId) return res.status(400).json({ error: 'Google ID token had no subject.' });
+    const email = typeof payload.email === 'string' ? payload.email.toLowerCase() : null;
+    const firstName = (payload.given_name || '').trim() || null;
+    const lastName  = (payload.family_name || '').trim() || null;
+    const { user, isNew } = await findOrCreateUserByIdentity({
+      googleUserId, email, firstName, lastName,
+    });
+    res.json({ user, isNew });
+  } catch (e) { sendError(res, e); }
+});
+
+// POST /api/auth/link-phone  body: { phone }  [authed]
+// Lets a freshly-Apple/Google-signed-in iOS user attach their phone to an
+// existing web account so they get all their web history (calendar, streak,
+// points). If the phone matches a different user we merge iOS -> web: the
+// web user's row survives (keeps its id), the iOS user's auth identifiers
+// migrate onto it, and the iOS row + its child rows are absorbed via
+// mergeUserInto. Client must replace its X-User-Id with the returned id.
+app.post('/api/auth/link-phone', async (req, res) => {
+  try {
+    const user = await requireUser(req);
+    const phone = normalizePhone(req.body?.phone);
+    if (!phone || phone.length < 7) {
+      return res.status(400).json({ error: 'Please enter a valid phone number.' });
+    }
+    const { data: matches } = await supabase.from('users').select('*').eq('phone', phone);
+    const others = (matches || []).filter(m => m.id !== user.id);
+
+    if (others.length === 0) {
+      // No conflict — just stamp the phone onto the current iOS user.
+      if (user.phone === phone) return res.json({ user });
+      const [updated] = await expectWrite(
+        `link phone ${phone} to user ${user.id}`,
+        1,
+        supabase.from('users').update({ phone }).eq('id', user.id).select('*'),
+      );
+      return res.json({ user: updated });
+    }
+
+    // Phone belongs to a different user (the web account). Merge iOS -> web.
+    const webUser = pickCanonicalUser(others);
+
+    // Move the iOS user's auth identifiers onto the web user. The unique
+    // constraints on apple_user_id / google_user_id / email mean we have to
+    // NULL them on the iOS row first, otherwise the update on the web row
+    // would collide with the still-present value on the iOS row.
+    const moves = {};
+    if (user.apple_user_id     && !webUser.apple_user_id)     moves.apple_user_id     = user.apple_user_id;
+    if (user.google_user_id    && !webUser.google_user_id)    moves.google_user_id    = user.google_user_id;
+    if (user.email             && !webUser.email)             moves.email             = user.email;
+    if (user.apns_device_token && !webUser.apns_device_token) moves.apns_device_token = user.apns_device_token;
+    if (user.timezone          && !webUser.timezone)          moves.timezone          = user.timezone;
+    if (user.first_name        && !webUser.first_name)        moves.first_name        = user.first_name;
+    if (user.last_name         && !webUser.last_name)         moves.last_name         = user.last_name;
+
+    const iosClears = {};
+    if (moves.apple_user_id)  iosClears.apple_user_id  = null;
+    if (moves.google_user_id) iosClears.google_user_id = null;
+    if (moves.email)          iosClears.email          = null;
+    if (Object.keys(iosClears).length > 0) {
+      const { error } = await supabase.from('users').update(iosClears).eq('id', user.id);
+      if (error) throw error;
+    }
+    if (Object.keys(moves).length > 0) {
+      const { error } = await supabase.from('users').update(moves).eq('id', webUser.id);
+      if (error) throw error;
+    }
+
+    // Absorb iOS row + all child rows into the web row.
+    await mergeUserInto(user.id, webUser.id);
+
+    const { data: fresh } = await supabase.from('users').select('*').eq('id', webUser.id).maybeSingle();
+    res.json({ user: fresh || webUser });
+  } catch (e) { sendError(res, e); }
+});
+
+// ---------------------------------------------------------------------------
+// iOS "me" endpoints (push token, notification prefs, account deletion)
+// ---------------------------------------------------------------------------
+
+// POST /api/me/push-token  body: { apnsDeviceToken, timezone }
+// Called by the native app on every launch (tokens rotate). Also stamps
+// last_seen_at so the cron handlers can prefer recently-active devices.
+app.post('/api/me/push-token', async (req, res) => {
+  try {
+    const user = await requireUser(req);
+    const apnsDeviceToken = String(req.body?.apnsDeviceToken || '').trim();
+    const timezone = String(req.body?.timezone || '').trim();
+    if (!apnsDeviceToken) return res.status(400).json({ error: 'Missing apnsDeviceToken.' });
+    const patch = {
+      apns_device_token: apnsDeviceToken,
+      last_seen_at: new Date().toISOString(),
+    };
+    if (timezone) patch.timezone = timezone;
+    await expectWrite(
+      `register push token for user ${user.id}`,
+      1,
+      supabase.from('users').update(patch).eq('id', user.id).select('id'),
+    );
+    res.json({ ok: true });
+  } catch (e) { sendError(res, e); }
+});
+
+// DELETE /api/me/push-token — clears the stored device token (used when the
+// user disables notifications system-wide or signs out). Cron handlers also
+// call this server-side path indirectly when APNs returns 410 Unregistered.
+app.delete('/api/me/push-token', async (req, res) => {
+  try {
+    const user = await requireUser(req);
+    await expectWrite(
+      `clear push token for user ${user.id}`,
+      1,
+      supabase.from('users').update({ apns_device_token: null }).eq('id', user.id).select('id'),
+    );
+    res.json({ ok: true });
+  } catch (e) { sendError(res, e); }
+});
+
+// PUT /api/me/notification-prefs  body: { daily?, passed?, streak? }
+// Each field is optional; we shallow-merge into the existing jsonb so a
+// client only sending one toggle doesn't blow away the others.
+app.put('/api/me/notification-prefs', async (req, res) => {
+  try {
+    const user = await requireUser(req);
+    const prev = (user.notification_prefs && typeof user.notification_prefs === 'object') ? user.notification_prefs : {};
+    const next = { ...prev };
+    if (typeof req.body?.daily  === 'boolean') next.daily  = req.body.daily;
+    if (typeof req.body?.passed === 'boolean') next.passed = req.body.passed;
+    if (typeof req.body?.streak === 'boolean') next.streak = req.body.streak;
+    const [updated] = await expectWrite(
+      `update notification prefs for user ${user.id}`,
+      1,
+      supabase.from('users').update({ notification_prefs: next }).eq('id', user.id).select('*'),
+    );
+    res.json({ user: updated });
+  } catch (e) { sendError(res, e); }
+});
+
+// POST /api/me/delete — hard delete per Apple 5.1.1(v). ON DELETE CASCADE on
+// every child FK takes care of memberships, points_ledger, learn_runs,
+// quiz_attempts, test_attempts, daily_rank_snapshots, activity_log. Games
+// where this user is admin cascade-delete (which removes their pairs).
+app.post('/api/me/delete', async (req, res) => {
+  try {
+    const user = await requireUser(req);
+    await expectWrite(
+      `delete user ${user.id}`,
+      1,
+      supabase.from('users').delete().eq('id', user.id).select('id'),
+    );
+    res.json({ ok: true });
+  } catch (e) { sendError(res, e); }
+});
+
+// ===========================================================================
+// CRON — push notification senders. Schedule lives in vercel.json. Each
+// handler is idempotent: re-running it on the same hour won't double-send
+// because targeting is recomputed from current DB state every invocation.
+// ===========================================================================
+
+// Vercel Cron Jobs send a GET request with `x-vercel-cron: 1`. For manual
+// testing or local dev, accept `Authorization: Bearer $CRON_SECRET` instead.
+function requireCron(req) {
+  if (req.header('x-vercel-cron')) return;
+  const expected = process.env.CRON_SECRET ? `Bearer ${process.env.CRON_SECRET}` : null;
+  if (expected && req.header('authorization') === expected) return;
+  const e = new Error('Cron auth required'); e.status = 401; throw e;
+}
+
+// Compute the wall-clock weekday/hour/date in the given IANA tz.
+// Returns null for an unknown/invalid timezone.
+function localPartsInTz(tz, date = new Date()) {
+  if (!tz) return null;
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      weekday: 'short', hour: '2-digit', hourCycle: 'h23',
+    }).formatToParts(date);
+    const map = {};
+    for (const p of parts) if (p.type !== 'literal') map[p.type] = p.value;
+    return {
+      weekday: map.weekday,                  // 'Mon'..'Sun'
+      hour: parseInt(map.hour, 10),          // 0..23
+      date: `${map.year}-${map.month}-${map.day}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// One send + 410-cleanup wrapper used by every cron handler. Bad/expired
+// tokens get NULLed in the DB so the next cron doesn't keep retrying them.
+async function sendOrCleanup(userId, deviceToken, payload) {
+  try {
+    await sendPush(deviceToken, payload);
+    return true;
+  } catch (err) {
+    if (err.unregistered) {
+      await supabase.from('users').update({ apns_device_token: null }).eq('id', userId);
+      console.warn('[gamify cron] cleared unregistered token for user', userId);
+    } else {
+      console.error('[gamify cron] push failed for user', userId, err.message);
+    }
+    return false;
+  }
+}
+
+// Read the full population of "send-eligible" users once per cron run.
+// Filters mirror the partial index idx_users_timezone_active.
+async function loadNotifiableUsers() {
+  const { data, error } = await supabase.from('users')
+    .select('id, first_name, apns_device_token, timezone, notification_prefs')
+    .is('deleted_at', null)
+    .not('apns_device_token', 'is', null)
+    .not('timezone', 'is', null);
+  if (error) throw error;
+  return data || [];
+}
+
+// Hourly. Targets users for whom it is currently 8:00 in their stored tz,
+// who have notification_prefs.daily ≠ false, and who have NOT logged any
+// activity today (in ET, since activity_log.date_et is always ET — close
+// enough; the cron only fires on each hour boundary anyway).
+async function runDailyQuizCron() {
+  const now = new Date();
+  const today = easternDateString(now);
+  const users = await loadNotifiableUsers();
+  let sent = 0, skipped = 0;
+  for (const u of users) {
+    const prefs = u.notification_prefs || {};
+    if (prefs.daily === false) { skipped++; continue; }
+    const parts = localPartsInTz(u.timezone, now);
+    if (!parts || parts.hour !== 8) { skipped++; continue; }
+    const { count, error: cErr } = await supabase.from('activity_log')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', u.id).eq('date_et', today);
+    if (cErr) throw cErr;
+    if ((count || 0) > 0) { skipped++; continue; }
+    const ok = await sendOrCleanup(u.id, u.apns_device_token, {
+      title: 'Daily Quiz',
+      body: u.first_name ? `${u.first_name}, your Daily Quiz is ready.` : 'Your Daily Quiz is ready.',
+      data: { type: 'daily-quiz' },
+    });
+    if (ok) sent++;
+  }
+  return { sent, skipped, considered: users.length };
+}
+
+// Hourly. Fires at Saturday 18:00 local-tz for users with a live streak last
+// week (≥1 activity Sun-Sat last week) but no activity this week so far.
+async function runStreakDangerCron() {
+  const now = new Date();
+  const week = easternWeekRange(now);
+  const users = await loadNotifiableUsers();
+  let sent = 0, skipped = 0;
+  for (const u of users) {
+    const prefs = u.notification_prefs || {};
+    if (prefs.streak === false) { skipped++; continue; }
+    const parts = localPartsInTz(u.timezone, now);
+    if (!parts || parts.weekday !== 'Sat' || parts.hour !== 18) { skipped++; continue; }
+
+    const { count: thisCount, error: e1 } = await supabase.from('activity_log')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', u.id)
+      .gte('date_et', week.thisStart).lte('date_et', week.thisEnd);
+    if (e1) throw e1;
+    if ((thisCount || 0) > 0) { skipped++; continue; }
+
+    const { count: lastCount, error: e2 } = await supabase.from('activity_log')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', u.id)
+      .gte('date_et', week.lastStart).lte('date_et', week.lastEnd);
+    if (e2) throw e2;
+    if ((lastCount || 0) < 1) { skipped++; continue; }
+
+    const ok = await sendOrCleanup(u.id, u.apns_device_token, {
+      title: 'Your streak ends tonight',
+      body: 'Take a quick session before midnight to keep it alive.',
+      data: { type: 'streak-danger' },
+    });
+    if (ok) sent++;
+  }
+  return { sent, skipped, considered: users.length };
+}
+
+// Every 10 minutes. For each game with recent point activity, recompute
+// ranks and compare to the snapshot in games.last_notified_ranks. Every
+// member whose new rank is worse (number got larger) gets a push naming
+// whoever now sits at the rank they used to hold. On the first run for a
+// game (bootstrap), we just record current ranks without sending.
+async function runLeaderboardChangesCron() {
+  // Constrain to games with new points since the last few cron runs. The
+  // 30m cutoff covers 10-min schedule jitter and clock skew.
+  const cutoffIso = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const { data: recent, error: lErr } = await supabase
+    .from('points_ledger').select('game_id').gte('earned_at', cutoffIso);
+  if (lErr) throw lErr;
+  const activeGameIds = [...new Set((recent || []).map(r => r.game_id))];
+  if (activeGameIds.length === 0) return { games: 0, sent: 0 };
+
+  const { data: games, error: gErr } = await supabase.from('games')
+    .select('id, title, last_notified_ranks').in('id', activeGameIds);
+  if (gErr) throw gErr;
+
+  let sent = 0;
+  for (const game of games || []) {
+    const { data: mems } = await supabase.from('memberships')
+      .select('user_id').eq('game_id', game.id);
+    const memberIds = (mems || []).map(m => m.user_id);
+    if (memberIds.length === 0) continue;
+
+    const { data: members } = await supabase.from('users')
+      .select('id, first_name, last_name, apns_device_token, notification_prefs, deleted_at')
+      .in('id', memberIds);
+    const { data: ledger } = await supabase.from('points_ledger')
+      .select('user_id, points').eq('game_id', game.id);
+    const totals = new Map();
+    for (const r of ledger || []) totals.set(r.user_id, (totals.get(r.user_id) || 0) + Number(r.points));
+
+    const rows = (members || []).map(m => ({
+      userId: m.id,
+      firstName: m.first_name || '',
+      lastName: m.last_name || '',
+      apnsToken: m.apns_device_token,
+      prefs: m.notification_prefs || {},
+      deletedAt: m.deleted_at,
+      totalPoints: Number(totals.get(m.id) || 0),
+    }));
+    rows.sort((a, b) => b.totalPoints - a.totalPoints
+      || (a.lastName + a.firstName).localeCompare(b.lastName + b.firstName));
+
+    const currentRanks = {};
+    const userByRank = {};
+    rows.forEach((r, i) => {
+      currentRanks[r.userId] = i + 1;
+      userByRank[i + 1] = r;
+    });
+
+    const prev = game.last_notified_ranks || {};
+    const isBootstrap = Object.keys(prev).length === 0;
+
+    if (!isBootstrap) {
+      for (const r of rows) {
+        if (r.deletedAt || !r.apnsToken) continue;
+        if (r.prefs.passed === false) continue;
+        const prevRank = prev[r.userId];
+        const newRank = currentRanks[r.userId];
+        if (prevRank == null) continue;       // brand-new member; nobody passed them
+        if (newRank <= prevRank) continue;    // didn't drop
+        const passer = userByRank[prevRank];
+        if (!passer || passer.userId === r.userId) continue;
+        const passerName = passer.firstName || 'Someone';
+        const ok = await sendOrCleanup(r.userId, r.apnsToken, {
+          title: game.title || 'Leaderboard update',
+          body: `${passerName} just passed you in ${game.title || 'your game'}.`,
+          data: { type: 'leaderboard-changes', gameId: game.id },
+        });
+        if (ok) sent++;
+      }
+    }
+
+    const { error: uErr } = await supabase.from('games')
+      .update({ last_notified_ranks: currentRanks }).eq('id', game.id);
+    if (uErr) throw uErr;
+  }
+  return { games: (games || []).length, sent };
+}
+
+// Register each cron on both GET (Vercel's default) and POST (curl smoke
+// tests with --request POST).
+function registerCron(path, handler) {
+  const wrapped = async (req, res) => {
+    try {
+      requireCron(req);
+      const result = await handler();
+      res.json({ ok: true, ...result });
+    } catch (e) { sendError(res, e); }
+  };
+  app.get(path, wrapped);
+  app.post(path, wrapped);
+}
+registerCron('/api/cron/notifications/daily-quiz',          runDailyQuizCron);
+registerCron('/api/cron/notifications/streak-danger',       runStreakDangerCron);
+registerCron('/api/cron/notifications/leaderboard-changes', runLeaderboardChangesCron);
 
 // ===========================================================================
 // GAMES

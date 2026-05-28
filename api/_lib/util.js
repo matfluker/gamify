@@ -18,6 +18,32 @@ export function easternDateString(date = new Date()) {
   return fmt.format(date);
 }
 
+// Return Sun-Sat date_et bounds for the ET week containing `date`, plus the
+// previous week. Used by the streak-danger cron to count this-week / last-week
+// activity. All dates are 'YYYY-MM-DD' strings comparable directly against
+// the `date_et` column (which is always Eastern).
+export function easternWeekRange(date = new Date()) {
+  const todayEt = easternDateString(date);
+  const weekdayShort = new Intl.DateTimeFormat('en-US', {
+    timeZone: APP_TIMEZONE, weekday: 'short',
+  }).format(date);
+  const idx = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(weekdayShort);
+  // Treat the ET date as a UTC midnight so setUTCDate arithmetic doesn't
+  // accidentally shift across a DST boundary mid-month.
+  const anchor = new Date(`${todayEt}T00:00:00Z`);
+  const addDays = (n) => {
+    const x = new Date(anchor);
+    x.setUTCDate(x.getUTCDate() + n);
+    return x.toISOString().slice(0, 10);
+  };
+  return {
+    thisStart: addDays(-idx),
+    thisEnd:   addDays(6 - idx),
+    lastStart: addDays(-idx - 7),
+    lastEnd:   addDays(6 - idx - 7),
+  };
+}
+
 export function genShareCode() {
   let out = '';
   for (let i = 0; i < SHARE_CODE_LENGTH; i++) {
