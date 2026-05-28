@@ -5,10 +5,5 @@
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api" },
     { "source": "/((?!api/).*)", "destination": "/index.html" }
-  ],
-  "crons": [
-    { "path": "/api/cron/notifications/daily-quiz",          "schedule": "0 * * * *" },
-    { "path": "/api/cron/notifications/streak-danger",       "schedule": "0 * * * *" },
-    { "path": "/api/cron/notifications/leaderboard-changes", "schedule": "*/10 * * * *" }
   ]
 }
